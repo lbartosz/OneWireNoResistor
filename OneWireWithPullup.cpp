@@ -1,14 +1,7 @@
 /*
 Copyright (c) 2007, Jim Studt  (original old version - many contributors since)
 
-Slightly modified by josh on 6/22/2014 to add support for internal pull-up resistors. 
- 
-More info at:
-
-  http://wp.josh.com/2014/06/21/no-external-pull-up-needed-for-ds18b20-temp-sensor
-
-Modifications based on the version of this library found at:
-
+The latest version of this library may be found at:
   http://www.pjrc.com/teensy/td_libs_OneWire.html
 
 OneWire has been maintained by Paul Stoffregen (paul@pjrc.com) since
@@ -18,6 +11,11 @@ contributors were interested in maintaining OneWire.  Paul typically
 works on OneWire every 6 to 12 months.  Patches usually wait that
 long.  If anyone is interested in more actively maintaining OneWire,
 please contact Paul.
+
+Version 2.3:
+  Unknonw chip fallback mode, Roger Clark
+  Teensy-LC compatibility, Paul Stoffregen
+  Search bug fix, Love Nystrom
 
 Version 2.2:
   Teensy 3.0 compatibility, Paul Stoffregen, paul@pjrc.com
@@ -121,10 +119,10 @@ sample code bearing this copyright.
 //--------------------------------------------------------------------------
 */
 
-#include "OneWire.h"
+#include "OneWireWithPullup.h"
 
 
-OneWire::OneWire(uint8_t pin)
+OneWireWithPullup::OneWireWithPullup(uint8_t pin)
 {
 	pinMode(pin, INPUT);
 	bitmask = PIN_TO_BITMASK(pin);
@@ -134,87 +132,49 @@ OneWire::OneWire(uint8_t pin)
 #endif
 }
 
-static uint8_t busFailFlag; 	// Set to one if bus failed to return to high via pull-up	
 
-// Perform the onewire reset function.  1=Ok to proceed, 0=no devices found or possible short to ground on bus
-
-// First we will send a reset pulse and see if any slaves send back 
-// a presence pulse. If not, then we return 0. 
-
-// Next we check to make sure that what we saw was really a presence
-// by checking to see if the bus returns to high by the pull-up. 
-// If not, then their might be a short to ground so we return a 0. 
-
-// Only if we both get a presence pulse, and we are able to see the bus return to high,
-// then we return a 1 to indicate ok to proceed.
-
-// Leaves with internal pull-up enabled
-
-uint8_t OneWire::reset(void)
+// Perform the onewire reset function.  We will wait up to 250uS for
+// the bus to come high, if it doesn't then it is broken or shorted
+// and we return a 0;
+//
+// Returns 1 if a device asserted a presence pulse, 0 otherwise.
+//
+uint8_t OneWireWithPullup::reset(void)
 {
-	uint8_t r;
-
 	IO_REG_TYPE mask = bitmask;
 	volatile IO_REG_TYPE *reg IO_REG_ASM = baseReg;
-	
-	// First drive the bus low to send reset pulse
-	
+	uint8_t r;
+	uint8_t retries = 125;
+
 	noInterrupts();
-	DIRECT_WRITE_LOW(reg, mask); 	 
-	DIRECT_MODE_OUTPUT(reg, mask);	 // drive output low
+	DIRECT_MODE_INPUT(reg, mask);
 	interrupts();
-	delayMicroseconds(480);			 // Wait for salves to see the reset pulse (Trstl) 
+	// wait until the wire is high... just in case
+	do {
+		if (--retries == 0) return 0;
+		delayMicroseconds(2);
+	} while ( !DIRECT_READ(reg, mask));
+
 	noInterrupts();
-	DIRECT_MODE_INPUT(reg, mask);	 // Stop driving high 
-	DIRECT_WRITE_HIGH( reg , mask ); // enable pull-up resistor
-	
-	delayMicroseconds(70);			 // give the slaves a chance to pull bus low 
-
-	r = !DIRECT_READ(reg, mask);     // if the bus is low now, it is a presence pulse from one or more slaves
+	DIRECT_WRITE_LOW(reg, mask);
+	DIRECT_MODE_OUTPUT(reg, mask);	// drive output low
 	interrupts();
-	delayMicroseconds(410);          // give slaves plenty of time to complete their presence pulse
-	
-	if (!DIRECT_READ(reg, mask)) {	 // Check to see if the bus has failed to return to high
-	
-	
-		busFailFlag = 1 ;			 // Remember that bus did not return to high. Used to support busTest() 
-		
-		return(0);					 // If the bus is still low, then there might be a short to ground,
-									 // so we should not continue because actively driving high might
-									 // fry stuff. Could also be that the pull-up is not strong enough 
-									 // for connected network, in which reading will not work anyway
-									 
-									 // It would be nice to break this out to help people debug bus problems,
-									 // but returning an extra value could break existing code. 
-	}									 	
-	
-	busFailFlag = 0 ;			 // Remember that bus did return to high. Used to support busTest() 
-	
-	return r;				     // return 0 if we saw a presence pulse or 1 if the bus stayed high after reset
-	
-	// Leave the pin in pull-up mode after reset
-	
-}
-
-// Only valid after a call to reset() that returned 0. 
-// Returns 1 if the bus did not float to
-// high after reset. Could indicate a short from bus to 
-// ground, or pull-up resistor too small for attached network
-
-// Would have been cleaner to fold this into a reset() return value, but that could have 
-// broken existing code that explicitly checks for reset() to have value of 1 to detect failure. 
-
-uint8_t OneWire::busFail() {
-	return busFailFlag;
+	delayMicroseconds(480);
+	noInterrupts();
+	DIRECT_MODE_INPUT(reg, mask);	// allow it to float
+    DIRECT_WRITE_HIGH( reg , mask ); // enable pull-up resistor
+	delayMicroseconds(70);
+	r = !DIRECT_READ(reg, mask);
+	interrupts();
+	delayMicroseconds(410);
+	return r;
 }
 
 //
 // Write a bit. Port and bit is used to cut lookup time and provide
 // more certain timing.
 //
-// Leaves bus actively driven high
-
-void OneWire::write_bit(uint8_t v)
+void OneWireWithPullup::write_bit(uint8_t v)
 {
 	IO_REG_TYPE mask=bitmask;
 	volatile IO_REG_TYPE *reg IO_REG_ASM = baseReg;
@@ -226,46 +186,38 @@ void OneWire::write_bit(uint8_t v)
 		delayMicroseconds(10);
 		DIRECT_WRITE_HIGH(reg, mask);	// drive output high
 		interrupts();
-		delayMicroseconds(55);			// Make sure output is high when slave samples 15us-60us after initial low 
+		delayMicroseconds(55);
 	} else {
 		noInterrupts();
 		DIRECT_WRITE_LOW(reg, mask);
 		DIRECT_MODE_OUTPUT(reg, mask);	// drive output low
-		delayMicroseconds(65);			// Make sure output is low when salve samples 15us-60us after initial low
-		DIRECT_WRITE_HIGH(reg, mask);	// drive high 
+		delayMicroseconds(65);
+		DIRECT_WRITE_HIGH(reg, mask);	// drive output high
 		interrupts();
-		delayMicroseconds(5);			// continue driving high for at least 1us recovery (Trec)
-	}	
+		delayMicroseconds(5);
+	}
 }
 
 //
 // Read a bit. Port and bit is used to cut lookup time and provide
 // more certain timing.
 //
-// Leaves bus with internal pull-up enabled 
-
-uint8_t OneWire::read_bit(void)
+uint8_t OneWireWithPullup::read_bit(void)
 {
 	IO_REG_TYPE mask=bitmask;
 	volatile IO_REG_TYPE *reg IO_REG_ASM = baseReg;
 	uint8_t r;
 
 	noInterrupts();
-	DIRECT_WRITE_LOW(reg, mask);	
 	DIRECT_MODE_OUTPUT(reg, mask);
-	delayMicroseconds(3);			// Initiate read slot (Tint) 
-			
+	DIRECT_WRITE_LOW(reg, mask);
+	delayMicroseconds(3);
 	DIRECT_MODE_INPUT(reg, mask);	// let pin float, pull up will raise
-	DIRECT_WRITE_HIGH( reg, mask);	// Enable pull-up
-	delayMicroseconds(10);			// Allow time for signal to rise (Trc) 
-	r = DIRECT_READ(reg, mask);		// Sample before the 15us deadline when the slave will stop pulling low (in the case of a 0 bit)
-									// (We allow 1us slop time buffer) 
+    DIRECT_WRITE_HIGH( reg , mask ); // enable pull-up resistor
+	delayMicroseconds(10);
+	r = DIRECT_READ(reg, mask);
 	interrupts();
-	delayMicroseconds(53);		
-									// Minimum slot time is 60us	
-									// We have already used 14us 
-									// Add an Extra 1us for recovery time
-									// Plus 5us of extra slop time to be safe in case of timing mismatches
+	delayMicroseconds(53);
 	return r;
 }
 
@@ -273,45 +225,46 @@ uint8_t OneWire::read_bit(void)
 // Write a byte. The writing code uses the active drivers to raise the
 // pin high, if you need power after the write (e.g. DS18S20 in
 // parasite power mode) then set 'power' to 1, otherwise the pin will
-// be left with pull-up enabled 
-
-void OneWire::write(uint8_t v, uint8_t power /* = 0 */) {
+// go tri-state at the end of the write to avoid heating in a short or
+// other mishap.
+//
+void OneWireWithPullup::write(uint8_t v, uint8_t power /* = 0 */) {
     uint8_t bitMask;
 
     for (bitMask = 0x01; bitMask; bitMask <<= 1) {
-		OneWire::write_bit( (bitMask & v)?1:0);
+	OneWireWithPullup::write_bit( (bitMask & v)?1:0);
     }
-	
-	// write_bit always returns with bus actively driven high,
-	// so if caller requests power then we don't need to do anything. 
-	
     if ( !power) {
-		noInterrupts();	
-		DIRECT_MODE_INPUT(baseReg, bitmask);	// if power not requested, then enable pull-up
-		interrupts();
+	noInterrupts();
+	DIRECT_MODE_INPUT(baseReg, bitmask);
+	interrupts();
     }
 }
 
-void OneWire::write_bytes(const uint8_t *buf, uint16_t count, bool power /* = 0 */) {
-  for (uint16_t i = 0 ; i < count ; i++) {
-    write(buf[i] , power );
+void OneWireWithPullup::write_bytes(const uint8_t *buf, uint16_t count, bool power /* = 0 */) {
+  for (uint16_t i = 0 ; i < count ; i++)
+    write(buf[i]);
+  if (!power) {
+    noInterrupts();
+    DIRECT_MODE_INPUT(baseReg, bitmask);
+    interrupts();
   }
 }
 
 //
 // Read a byte
 //
-uint8_t OneWire::read() {
+uint8_t OneWireWithPullup::read() {
     uint8_t bitMask;
     uint8_t r = 0;
 
     for (bitMask = 0x01; bitMask; bitMask <<= 1) {
-	if ( OneWire::read_bit()) r |= bitMask;
+	if ( OneWireWithPullup::read_bit()) r |= bitMask;
     }
     return r;
 }
 
-void OneWire::read_bytes(uint8_t *buf, uint16_t count) {
+void OneWireWithPullup::read_bytes(uint8_t *buf, uint16_t count) {
   for (uint16_t i = 0 ; i < count ; i++)
     buf[i] = read();
 }
@@ -319,7 +272,7 @@ void OneWire::read_bytes(uint8_t *buf, uint16_t count) {
 //
 // Do a ROM select
 //
-void OneWire::select(const uint8_t rom[8])
+void OneWireWithPullup::select(const uint8_t rom[8])
 {
     uint8_t i;
 
@@ -331,12 +284,12 @@ void OneWire::select(const uint8_t rom[8])
 //
 // Do a ROM skip
 //
-void OneWire::skip()
+void OneWireWithPullup::skip()
 {
     write(0xCC);           // Skip ROM
 }
 
-void OneWire::depower()
+void OneWireWithPullup::depower()
 {
 	noInterrupts();
 	DIRECT_MODE_INPUT(baseReg, bitmask);
@@ -349,7 +302,7 @@ void OneWire::depower()
 // You need to use this function to start a search again from the beginning.
 // You do not need to do it for the first search, though you could.
 //
-void OneWire::reset_search()
+void OneWireWithPullup::reset_search()
 {
   // reset the search state
   LastDiscrepancy = 0;
@@ -364,7 +317,7 @@ void OneWire::reset_search()
 // Setup the search to find the device type 'family_code' on the next call
 // to search(*newAddr) if it is present.
 //
-void OneWire::target_search(uint8_t family_code)
+void OneWireWithPullup::target_search(uint8_t family_code)
 {
    // set the search state to find SearchFamily type devices
    ROM_NO[0] = family_code;
@@ -378,10 +331,10 @@ void OneWire::target_search(uint8_t family_code)
 //
 // Perform a search. If this function returns a '1' then it has
 // enumerated the next device and you may retrieve the ROM from the
-// OneWire::address variable. If there are no devices, no further
+// OneWireWithPullup::address variable. If there are no devices, no further
 // devices, or something horrible happens in the middle of the
 // enumeration then a 0 is returned.  If a new device is found then
-// its address is copied to newAddr.  Use OneWire::reset_search() to
+// its address is copied to newAddr.  Use OneWireWithPullup::reset_search() to
 // start over.
 //
 // --- Replaced by the one from the Dallas Semiconductor web site ---
@@ -391,7 +344,7 @@ void OneWire::target_search(uint8_t family_code)
 // Return TRUE  : device found, ROM number in ROM_NO buffer
 //        FALSE : device not found, end of search
 //
-uint8_t OneWire::search(uint8_t *newAddr)
+uint8_t OneWireWithPullup::search(uint8_t *newAddr, bool search_mode /* = true */)
 {
    uint8_t id_bit_number;
    uint8_t last_zero, rom_byte_number, search_result;
@@ -420,7 +373,11 @@ uint8_t OneWire::search(uint8_t *newAddr)
       }
 
       // issue the search command
-      write(0xF0);
+      if (search_mode == true) {
+        write(0xF0);   // NORMAL SEARCH
+      } else {
+        write(0xEC);   // CONDITIONAL SEARCH
+      }
 
       // loop to do the search
       do
@@ -504,8 +461,9 @@ uint8_t OneWire::search(uint8_t *newAddr)
       LastDeviceFlag = FALSE;
       LastFamilyDiscrepancy = 0;
       search_result = FALSE;
+   } else {
+      for (int i = 0; i < 8; i++) newAddr[i] = ROM_NO[i];
    }
-   for (int i = 0; i < 8; i++) newAddr[i] = ROM_NO[i];
    return search_result;
   }
 
@@ -544,7 +502,7 @@ static const uint8_t PROGMEM dscrc_table[] = {
 // compared to all those delayMicrosecond() calls.  But I got
 // confused, so I use this table from the examples.)
 //
-uint8_t OneWire::crc8(const uint8_t *addr, uint8_t len)
+uint8_t OneWireWithPullup::crc8(const uint8_t *addr, uint8_t len)
 {
 	uint8_t crc = 0;
 
@@ -558,7 +516,7 @@ uint8_t OneWire::crc8(const uint8_t *addr, uint8_t len)
 // Compute a Dallas Semiconductor 8 bit CRC directly.
 // this is much slower, but much smaller, than the lookup table.
 //
-uint8_t OneWire::crc8(const uint8_t *addr, uint8_t len)
+uint8_t OneWireWithPullup::crc8(const uint8_t *addr, uint8_t len)
 {
 	uint8_t crc = 0;
 	
@@ -576,13 +534,13 @@ uint8_t OneWire::crc8(const uint8_t *addr, uint8_t len)
 #endif
 
 #if ONEWIRE_CRC16
-bool OneWire::check_crc16(const uint8_t* input, uint16_t len, const uint8_t* inverted_crc, uint16_t crc)
+bool OneWireWithPullup::check_crc16(const uint8_t* input, uint16_t len, const uint8_t* inverted_crc, uint16_t crc)
 {
     crc = ~crc16(input, len, crc);
     return (crc & 0xFF) == inverted_crc[0] && (crc >> 8) == inverted_crc[1];
 }
 
-uint16_t OneWire::crc16(const uint8_t* input, uint16_t len, uint16_t crc)
+uint16_t OneWireWithPullup::crc16(const uint8_t* input, uint16_t len, uint16_t crc)
 {
     static const uint8_t oddparity[16] =
         { 0, 1, 1, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0, 1, 1, 0 };
